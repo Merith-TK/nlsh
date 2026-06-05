@@ -20,7 +20,7 @@ func main() {
 		fatalf("config error: %v", err)
 	}
 
-	// Apply env overrides.
+	// Apply env overrides first.
 	if v := os.Getenv("NLSH_PROVIDER"); v != "" && cfg.Provider.Type == "" {
 		cfg.Provider.Type = v
 	}
@@ -44,18 +44,56 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Detect subcommand by lowercasing arg 0.
-	sub := strings.ToLower(args[0])
+	// --- Global flag pre-parse ---
+	// We scan for --llm-model, --provider, etc. before subcommand dispatch.
+	// These flags are also removed from args so subcommands don't choke on them.
+	cfg, args = applyGlobalFlags(cfg, args)
+
+	// Detect subcommand by lowercasing arg 0 (skip any leading flags).
+	subIdx := 0
+	for subIdx < len(args) && strings.HasPrefix(args[subIdx], "-") {
+		subIdx++
+	}
+	if subIdx >= len(args) {
+		printHelp()
+		os.Exit(0)
+	}
+
+	sub := strings.ToLower(args[subIdx])
+	remaining := append(args[:subIdx], args[subIdx+1:]...)
 
 	switch sub {
 	case "review":
-		reviewCmd(cfg, args[1:])
+		reviewCmd(cfg, remaining)
 	case "harness":
-		harnessCmd(cfg, args[1:])
+		harnessCmd(cfg, remaining)
 	default:
-		// One-shot mode: all args are the natural language input.
+		// One-shot mode: all args (including subIdx arg which is the input) are the natural language input.
 		oneShotCmd(cfg, args)
 	}
+}
+
+// applyGlobalFlags scans args for global flags, applies them to cfg, and returns the filtered args.
+func applyGlobalFlags(cfg types.Config, args []string) (types.Config, []string) {
+	var filtered []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch a {
+		case "--llm-model", "--model":
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				cfg.Provider.Model = args[i+1]
+				i++ // skip value
+			}
+		case "--provider":
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				cfg.Provider.Type = args[i+1]
+				i++ // skip value
+			}
+		default:
+			filtered = append(filtered, a)
+		}
+	}
+	return cfg, filtered
 }
 
 func reviewCmd(cfg types.Config, args []string) {
@@ -127,8 +165,6 @@ func oneShotCmd(cfg types.Config, args []string) {
 	dryRun := fs.Bool("dry-run", false, "Translate and show commands, never execute")
 	autoApprove := fs.Bool("yes", false, "Auto-approve all HIGH risk commands")
 	fs.Bool("y", false, "Auto-approve all HIGH risk commands (short)")
-	providerFlag := fs.String("provider", "", "Override provider (anthropic|openai)")
-	modelFlag := fs.String("model", "", "Override model")
 	promptFlag := fs.String("prompt", "", "Append a one-off instruction to the master prompt")
 	noHistory := fs.Bool("no-history", false, "Skip reading and writing history")
 	plain := fs.Bool("plain", false, "Suppress styling")
@@ -151,8 +187,6 @@ func oneShotCmd(cfg types.Config, args []string) {
 		Input:       input,
 		DryRun:      *dryRun,
 		AutoApprove: *autoApprove,
-		Provider:    *providerFlag,
-		Model:       *modelFlag,
 		Prompt:      *promptFlag,
 		NoHistory:   *noHistory,
 		Plain:       *plain,
@@ -167,23 +201,25 @@ func printHelp() {
 	fmt.Println(`nlsh — Natural Language Shell
 
 Usage:
-  nlsh "<natural language input>"     One-shot translate and execute
-  nlsh harness                        Start interactive harness REPL
-  nlsh harness "<input>"              Harness one-shot (manual confirm)
-  nlsh review                         Review both histories
-  nlsh review --one-shot-only         Review only one-shot history
-  nlsh review --harness-only          Review only harness history
-  nlsh --history                      Print one-shot history
-  nlsh --clear-history                Clear one-shot history
+  nlsh "<natural language input>"           One-shot translate and execute
+  nlsh harness                              Start interactive harness REPL
+  nlsh harness "<input>"                    Harness one-shot (manual confirm)
+  nlsh review                               Review both histories
+  nlsh review --one-shot-only               Review only one-shot history
+  nlsh review --harness-only                Review only harness history
+  nlsh --history                            Print one-shot history
+  nlsh --clear-history                      Clear one-shot history
 
-Flags:
-  --dry-run        Translate and show, never execute
-  --yes, -y        Auto-approve HIGH risk commands
-  --provider       Override provider (anthropic|openai)
-  --model          Override model
-  --prompt         Append one-off instruction to master prompt
-  --no-history     Skip reading and writing history
-  --plain          Suppress styling`)
+Global Flags (all modes):
+  --llm-model <name>                        Override model for this invocation
+  --provider <anthropic|openai>             Override provider for this invocation
+
+One-Shot Flags:
+  --dry-run                                 Translate and show, never execute
+  --yes, -y                                 Auto-approve HIGH risk commands
+  --prompt "<text>"                         Append one-off instruction to master prompt
+  --no-history                              Skip reading and writing history
+  --plain                                   Suppress styling`)
 }
 
 func fatalf(format string, args ...any) {
