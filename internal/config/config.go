@@ -27,6 +27,12 @@ func DefaultConfig() types.Config {
 		Risk: types.RiskConfig{
 			AutoApprove: false,
 		},
+		Harness: types.HarnessConfig{
+			ContextTurns: 10,
+			RecallLimit:  5,
+			HistoryFile:  filepath.Join(home, "nlsh_harness_history.json"),
+			AutoApprove:  false,
+		},
 	}
 }
 
@@ -51,6 +57,7 @@ func Load() (types.Config, error) {
 	// Expand ~ in file paths after loading.
 	cfg.Prompts.MasterPromptFile = expandHome(cfg.Prompts.MasterPromptFile, home)
 	cfg.History.File = expandHome(cfg.History.File, home)
+	cfg.Harness.HistoryFile = expandHome(cfg.Harness.HistoryFile, home)
 
 	return cfg, nil
 }

@@ -4,6 +4,7 @@ package run
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -16,11 +17,40 @@ import (
 	"github.com/Merith-TK/nlsh/internal/types"
 )
 
+// presentCommandTool is the tool the agent uses to return translated commands.
+var presentCommandTool = provider.Tool{
+	Name:        "present_command",
+	Description: "Present the translated shell command(s) to the user with a risk assessment.",
+	Schema: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"commands": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Ordered list of shell commands to run",
+			},
+			"chained": map[string]any{
+				"type":        "boolean",
+				"description": "If true, join with && and run as one shell invocation",
+			},
+			"risk": map[string]any{
+				"type":        "string",
+				"enum":        []string{"LOW", "HIGH"},
+				"description": "Risk level of the command set",
+			},
+			"rationale": map[string]any{
+				"type":        "string",
+				"description": "One sentence explaining the risk assessment",
+			},
+		},
+		"required": []string{"commands", "chained", "risk", "rationale"},
+	},
+}
+
 // Execute performs the full nlsh flow for a natural language input.
 func Execute(cfg types.Config, opts types.RunOptions) error {
 	ctx := context.Background()
 
-	// Build provider config, respecting CLI overrides.
 	provCfg := cfg.Provider
 	if opts.Provider != "" {
 		provCfg.Type = opts.Provider
@@ -34,7 +64,10 @@ func Execute(cfg types.Config, opts types.RunOptions) error {
 		return err
 	}
 
-	// Load history for context.
+	if provCfg.FallbackTools {
+		fmt.Fprintln(os.Stderr, "warning: provider does not support tool-calling; using fallback mode")
+	}
+
 	var histEntries []types.HistoryEntry
 	if !opts.NoHistory {
 		histEntries, err = history.Last(cfg.History.File, cfg.History.ContextEntries)
@@ -43,43 +76,26 @@ func Execute(cfg types.Config, opts types.RunOptions) error {
 		}
 	}
 
-	// Assemble system prompt.
 	home, _ := os.UserHomeDir()
 	reviewFile := home + "/nlsh_review.md"
-	systemPrompt := prompt.Assemble(reviewFile, cfg.Prompts.MasterPromptFile, opts.Prompt, histEntries)
+	systemPrompt := prompt.Assemble(reviewFile, cfg.Prompts.MasterPromptFile, opts.Prompt, histEntries, provCfg.FallbackTools)
 
-	// Build initial conversation.
 	messages := []provider.Message{
 		{Role: "user", Content: opts.Input},
 	}
 
-	// Main loop — handles inline refinement and rejection continuation.
+	return runLoop(ctx, cfg, opts, client, systemPrompt, messages, opts.Input)
+}
+
+// runLoop handles translation, confirmation, execution, and refinement.
+func runLoop(ctx context.Context, cfg types.Config, opts types.RunOptions, client provider.Client, systemPrompt string, messages []provider.Message, originalInput string) error {
 	for {
-		raw, err := callAgent(ctx, client, systemPrompt, messages)
+		resp, err := translate(ctx, client, systemPrompt, messages)
 		if err != nil {
 			return err
 		}
 
-		resp, err := provider.ParseAgentResponse(raw)
-		if err != nil {
-			// Retry once.
-			messages = append(messages, provider.Message{Role: "assistant", Content: raw})
-			messages = append(messages, provider.Message{Role: "user", Content: "Your previous response was not valid JSON. Return only valid JSON matching the schema."})
-			raw2, err2 := callAgent(ctx, client, systemPrompt, messages)
-			if err2 != nil {
-				return err2
-			}
-			resp, err = provider.ParseAgentResponse(raw2)
-			if err != nil {
-				return fmt.Errorf("agent returned invalid JSON twice:\n%s", raw2)
-			}
-			raw = raw2
-		}
-
-		// Apply risk overrides from config.
 		resp.Risk = applyRiskOverrides(resp, cfg.Risk)
-
-		// Display translated commands.
 		printTranslation(resp, opts.Plain)
 
 		if opts.DryRun {
@@ -89,15 +105,13 @@ func Execute(cfg types.Config, opts types.RunOptions) error {
 		autoApprove := opts.AutoApprove || cfg.Risk.AutoApprove
 
 		if resp.Risk == "LOW" || autoApprove {
-			// Auto-execute.
 			outcome, execErr := executeCommands(resp)
 			if !opts.NoHistory {
-				writeHistory(cfg.History.File, opts.Input, resp, outcome, client)
+				writeHistory(cfg.History.File, originalInput, resp, outcome, client)
 			}
 			return execErr
 		}
 
-		// HIGH risk — confirm prompt.
 		answer, promptErr := confirmPrompt(opts.Plain)
 		if promptErr != nil {
 			return promptErr
@@ -107,40 +121,37 @@ func Execute(cfg types.Config, opts types.RunOptions) error {
 		case "", "y":
 			outcome, execErr := executeCommands(resp)
 			if !opts.NoHistory {
-				writeHistory(cfg.History.File, opts.Input, resp, outcome, client)
+				writeHistory(cfg.History.File, originalInput, resp, outcome, client)
 			}
 			return execErr
 
 		case "n":
 			if !opts.NoHistory {
-				writeHistory(cfg.History.File, opts.Input, resp, types.OutcomeRejected, client)
+				writeHistory(cfg.History.File, originalInput, resp, types.OutcomeRejected, client)
 			}
-			// Rejection continuation.
 			clarification, quitErr := rejectionPrompt(opts.Plain)
 			if quitErr != nil {
 				return quitErr
 			}
-			// Build next turn: append the assistant response and the rejection context.
 			messages = append(messages,
-				provider.Message{Role: "assistant", Content: raw},
+				provider.Message{Role: "assistant", Content: marshalAgentResponse(resp)},
 				provider.Message{Role: "user", Content: "Rejected. " + clarification},
 			)
 			continue
 
 		case "q", "quit":
 			if !opts.NoHistory {
-				writeHistory(cfg.History.File, opts.Input, resp, types.OutcomeCanceled, client)
+				writeHistory(cfg.History.File, originalInput, resp, types.OutcomeCanceled, client)
 			}
 			fmt.Println("Canceled.")
 			os.Exit(1)
 
 		default:
-			// Natural language refinement.
 			if !opts.NoHistory {
-				writeHistory(cfg.History.File, opts.Input, resp, types.OutcomeRejected, client)
+				writeHistory(cfg.History.File, originalInput, resp, types.OutcomeRejected, client)
 			}
 			messages = append(messages,
-				provider.Message{Role: "assistant", Content: raw},
+				provider.Message{Role: "assistant", Content: marshalAgentResponse(resp)},
 				provider.Message{Role: "user", Content: answer},
 			)
 			continue
@@ -148,12 +159,29 @@ func Execute(cfg types.Config, opts types.RunOptions) error {
 	}
 }
 
-func callAgent(ctx context.Context, client provider.Client, systemPrompt string, messages []provider.Message) (string, error) {
-	raw, err := client.Complete(ctx, systemPrompt, messages)
+// translate calls the agent and extracts the AgentResponse.
+func translate(ctx context.Context, client provider.Client, systemPrompt string, messages []provider.Message) (types.AgentResponse, error) {
+	result, err := client.Complete(ctx, systemPrompt, messages, []provider.Tool{presentCommandTool})
 	if err != nil {
-		return "", err
+		return types.AgentResponse{}, err
 	}
-	return raw, nil
+
+	if result.ToolCall != nil && result.ToolCall.Name == "present_command" {
+		var resp types.AgentResponse
+		argsJSON, _ := json.Marshal(result.ToolCall.Arguments)
+		if err := json.Unmarshal(argsJSON, &resp); err != nil {
+			return resp, fmt.Errorf("failed to parse present_command arguments: %w", err)
+		}
+		return resp, nil
+	}
+
+	// Fallback mode: parse content as raw JSON.
+	return provider.ParseAgentResponse(result.Content)
+}
+
+func marshalAgentResponse(resp types.AgentResponse) string {
+	b, _ := json.Marshal(resp)
+	return string(b)
 }
 
 func printTranslation(resp types.AgentResponse, plain bool) {

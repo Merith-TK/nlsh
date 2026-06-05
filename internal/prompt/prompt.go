@@ -10,20 +10,30 @@ import (
 	"github.com/Merith-TK/nlsh/internal/types"
 )
 
-const kissSystemPrompt = `You are a shell command translator. Given a natural language description of what the user wants to do, translate it into the minimum viable shell command(s).
+const toolSystemPrompt = `You are a shell command translator. Given a natural language description of what the user wants to do, translate it into the minimum viable shell command(s).
 
 Rules:
 - Prefer simple, readable commands over clever one-liners.
 - Never hallucinate flags or paths not clearly implied by the input or history.
 - Assign risk honestly: LOW for read-only/safe operations, HIGH for anything destructive, stateful, or irreversible.
-- Return ONLY valid JSON matching this exact schema — no explanation, no markdown, no extra text:
-  {
-    "commands": ["<cmd1>", "<cmd2>"],
-    "chained": true|false,
-    "risk": "LOW"|"HIGH",
-    "rationale": "<one sentence>"
-  }
-- "chained": true means join commands with && in a single shell invocation. false means run sequentially with output shown between each.`
+- You MUST use the present_command tool to return your translation. Do not output raw text.`
+
+const fallbackSystemPrompt = `You are a shell command translator. Given a natural language description of what the user wants to do, translate it into the minimum viable shell command(s).
+
+Rules:
+- Prefer simple, readable commands over clever one-liners.
+- Never hallucinate flags or paths not clearly implied by the input or history.
+- Assign risk honestly: LOW for read-only/safe operations, HIGH for anything destructive, stateful, or irreversible.
+
+IMPORTANT: Your provider does not support tool-calling. Return raw JSON matching this exact schema:
+{
+  "commands": ["<cmd1>", "<cmd2>"],
+  "chained": true|false,
+  "risk": "LOW"|"HIGH",
+  "rationale": "<one sentence>"
+}
+
+No explanation, no markdown, no extra text.`
 
 // Assemble builds the full system prompt string from all layers.
 func Assemble(
@@ -31,6 +41,7 @@ func Assemble(
 	masterPromptFile string,
 	extraPrompt string,
 	historyEntries []types.HistoryEntry,
+	fallback bool,
 ) string {
 	var parts []string
 
@@ -53,7 +64,11 @@ func Assemble(
 	}
 
 	// Layer 3: KISS system prompt
-	parts = append(parts, kissSystemPrompt)
+	if fallback {
+		parts = append(parts, fallbackSystemPrompt)
+	} else {
+		parts = append(parts, toolSystemPrompt)
+	}
 
 	// Layer 4: History block
 	if len(historyEntries) > 0 {
