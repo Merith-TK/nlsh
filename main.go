@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Merith-TK/nlsh/internal/benchmark"
 	"github.com/Merith-TK/nlsh/internal/config"
 	"github.com/Merith-TK/nlsh/internal/harness"
 	"github.com/Merith-TK/nlsh/internal/history"
@@ -67,6 +68,8 @@ func main() {
 		reviewCmd(cfg, remaining)
 	case "harness":
 		harnessCmd(cfg, remaining)
+	case "benchmark":
+		benchmarkCmd(cfg, remaining)
 	default:
 		// One-shot mode: all args (including subIdx arg which is the input) are the natural language input.
 		oneShotCmd(cfg, args)
@@ -197,6 +200,33 @@ func oneShotCmd(cfg types.Config, args []string) {
 	}
 }
 
+func benchmarkCmd(cfg types.Config, args []string) {
+	fs := flag.NewFlagSet("benchmark", flag.ExitOnError)
+	modelsFlag := fs.String("models", "", "Comma-separated list of models to benchmark")
+	queriesFlag := fs.String("queries", "", "Comma-separated list of queries (default: built-in suite)")
+	fs.Parse(args)
+
+	if *modelsFlag == "" {
+		fatalf("benchmark requires --models flag, e.g. --models deepseek-v4-flash,qwen3.6-plus")
+	}
+	models := strings.Split(*modelsFlag, ",")
+	for i := range models {
+		models[i] = strings.TrimSpace(models[i])
+	}
+
+	var queries []string
+	if *queriesFlag != "" {
+		queries = strings.Split(*queriesFlag, ",")
+		for i := range queries {
+			queries[i] = strings.TrimSpace(queries[i])
+		}
+	}
+
+	if err := benchmark.Run(cfg, models, queries); err != nil {
+		fatalf("benchmark failed: %v", err)
+	}
+}
+
 func printHelp() {
 	fmt.Println(`nlsh — Natural Language Shell
 
@@ -207,6 +237,7 @@ Usage:
   nlsh review                               Review both histories
   nlsh review --one-shot-only               Review only one-shot history
   nlsh review --harness-only                Review only harness history
+  nlsh benchmark --models m1,m2             Benchmark models head-to-head
   nlsh --history                            Print one-shot history
   nlsh --clear-history                      Clear one-shot history
 
