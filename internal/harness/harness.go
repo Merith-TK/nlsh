@@ -11,7 +11,8 @@ import (
 	"time"
 
 	"github.com/Merith-TK/nlsh/internal/executor"
-	nlshhistory "github.com/Merith-TK/nlsh/internal/history"
+	"github.com/Merith-TK/nlsh/internal/fs"
+	"github.com/Merith-TK/nlsh/internal/history"
 	"github.com/Merith-TK/nlsh/internal/prompt"
 	"github.com/Merith-TK/nlsh/internal/provider"
 	"github.com/Merith-TK/nlsh/internal/types"
@@ -31,6 +32,30 @@ var (
 				"rationale": map[string]any{"type": "string"},
 			},
 			"required": []string{"commands", "chained", "risk", "rationale"},
+		},
+	}
+
+	exploreDirectoryTool = provider.Tool{
+		Name:        "explore_directory",
+		Description: "List the contents of a directory. Limited depth. Use only when needed to understand the workspace.",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "Directory path to explore"},
+			},
+			"required": []string{"path"},
+		},
+	}
+
+	readFileTool = provider.Tool{
+		Name:        "read_file",
+		Description: "Read a text file with line limits. Use only when needed to understand file contents before translating.",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "File path to read"},
+			},
+			"required": []string{"path"},
 		},
 	}
 
@@ -70,7 +95,7 @@ func NewSession(cfg types.Config) (*Session, error) {
 		fmt.Fprintln(os.Stderr, "warning: provider does not support tool-calling; using fallback mode")
 	}
 
-	histEntries, _ := nlshhistory.Last(cfg.History.File, cfg.History.ContextEntries)
+	histEntries, _ := history.Last(cfg.History.File, cfg.History.ContextEntries)
 
 	home, _ := os.UserHomeDir()
 	reviewFile := home + "/nlsh_review.md"
@@ -197,9 +222,9 @@ func (s *Session) processTurn(ctx context.Context, input string) error {
 	}
 }
 
-// translate calls the agent, handling both present_command and recall_history tools.
+// translate calls the agent, handling filesystem tools and recall_history.
 func (s *Session) translate(ctx context.Context) (types.AgentResponse, error) {
-	tools := []provider.Tool{presentCommandTool, recallHistoryTool}
+	tools := []provider.Tool{presentCommandTool, exploreDirectoryTool, readFileTool, recallHistoryTool}
 	if s.Cfg.Provider.FallbackTools {
 		tools = nil // fallback: no tools, raw JSON
 	}
@@ -220,39 +245,84 @@ func (s *Session) translate(ctx context.Context) (types.AgentResponse, error) {
 			return types.AgentResponse{}, fmt.Errorf("agent did not call a tool; raw: %s", result.Content)
 		}
 
-		if result.ToolCall.Name == "present_command" {
+		tc := result.ToolCall
+		toolCallID := tc.ID
+		if toolCallID == "" {
+			toolCallID = fmt.Sprintf("%s_1", tc.Name)
+		}
+
+		switch tc.Name {
+		case "present_command":
 			var resp types.AgentResponse
-			argsJSON, _ := json.Marshal(result.ToolCall.Arguments)
+			argsJSON, _ := json.Marshal(tc.Arguments)
 			if err := json.Unmarshal(argsJSON, &resp); err != nil {
 				return resp, fmt.Errorf("failed to parse present_command arguments: %w", err)
 			}
 			return resp, nil
-		}
 
-		if result.ToolCall.Name == "recall_history" {
-			query, _ := result.ToolCall.Arguments["query"].(string)
-			limitF, _ := result.ToolCall.Arguments["limit"].(float64)
+		case "explore_directory":
+			path, _ := tc.Arguments["path"].(string)
+			res := fs.ExploreDirectory(path, 2) // harness: deeper depth
+			content := res.Content
+			if res.Error != "" {
+				content = fmt.Sprintf("Error: %s", res.Error)
+			}
+			s.Messages = append(s.Messages,
+				provider.Message{Role: "assistant", ToolCalls: []provider.ToolCall{*tc}},
+				provider.Message{Role: "user", ToolResults: []provider.ToolResult{
+					{ToolCallID: toolCallID, Name: "explore_directory", Content: content},
+				}},
+			)
+			continue
+
+		case "read_file":
+			path, _ := tc.Arguments["path"].(string)
+			res := fs.ReadFile(path, 500, false) // harness: more lines
+			content := res.Content
+			if res.Error != "" {
+				if strings.Contains(res.Error, "Allow reading it for this session") {
+					fmt.Println()
+					fmt.Println("  ", res.Error)
+					if fs.AskSecretPrompt(path) {
+						res = fs.ReadFile(path, 500, true)
+						content = res.Content
+						if res.Error != "" {
+							content = fmt.Sprintf("Error: %s", res.Error)
+						}
+					} else {
+						content = "User declined to allow reading this file."
+					}
+				} else {
+					content = fmt.Sprintf("Error: %s", res.Error)
+				}
+			}
+			s.Messages = append(s.Messages,
+				provider.Message{Role: "assistant", ToolCalls: []provider.ToolCall{*tc}},
+				provider.Message{Role: "user", ToolResults: []provider.ToolResult{
+					{ToolCallID: toolCallID, Name: "read_file", Content: content},
+				}},
+			)
+			continue
+
+		case "recall_history":
+			query, _ := tc.Arguments["query"].(string)
+			limitF, _ := tc.Arguments["limit"].(float64)
 			limit := int(limitF)
 			if limit <= 0 {
 				limit = s.Cfg.Harness.RecallLimit
 			}
 			results := recallHistory(s.Cfg.Harness.HistoryFile, query, limit)
-			
-			// Inject tool result back into conversation.
-			toolCallID := result.ToolCall.ID
-			if toolCallID == "" {
-				toolCallID = "recall_1"
-			}
 			s.Messages = append(s.Messages,
-				provider.Message{Role: "assistant", ToolCalls: []provider.ToolCall{*result.ToolCall}},
+				provider.Message{Role: "assistant", ToolCalls: []provider.ToolCall{*tc}},
 				provider.Message{Role: "user", ToolResults: []provider.ToolResult{
 					{ToolCallID: toolCallID, Name: "recall_history", Content: results},
 				}},
 			)
-			continue // Re-prompt agent with recall results.
-		}
+			continue
 
-		return types.AgentResponse{}, fmt.Errorf("agent called unknown tool %q", result.ToolCall.Name)
+		default:
+			return types.AgentResponse{}, fmt.Errorf("agent called unknown tool %q", tc.Name)
+		}
 	}
 }
 
